@@ -11,7 +11,10 @@ import type {
 } from '@qwen-code/qwen-code-core';
 import { GeminiEventType, OutputFormat } from '@qwen-code/qwen-code-core';
 import type { Part } from '@google/genai';
-import { JsonOutputAdapter } from './JsonOutputAdapter.js';
+import {
+  JsonOutputAdapter,
+  unwrapToolResultText,
+} from './JsonOutputAdapter.js';
 
 function createMockConfig(): Config {
   return {
@@ -861,5 +864,252 @@ describe('JsonOutputAdapter', () => {
         ),
       ).toBeDefined();
     });
+  });
+
+  describe('codex-style TEXT mode tracing', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let stderrWriteSpy: any;
+
+    beforeEach(() => {
+      vi.mocked(mockConfig.getOutputFormat).mockReturnValue(OutputFormat.TEXT);
+      stderrWriteSpy = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
+      adapter.startAssistantMessage();
+    });
+
+    afterEach(() => {
+      stderrWriteSpy.mockRestore();
+    });
+
+    it('streams Content events to stderr in real time', () => {
+      adapter.processEvent({
+        type: GeminiEventType.Content,
+        value: 'Hello ',
+      });
+      adapter.processEvent({
+        type: GeminiEventType.Content,
+        value: 'world',
+      });
+
+      const calls = stderrWriteSpy.mock.calls.map((c: unknown[]) => c[0]);
+      expect(calls).toContain('Hello ');
+      expect(calls).toContain('world');
+    });
+
+    it('emits the full accumulated content to stdout in emitResult', () => {
+      adapter.processEvent({
+        type: GeminiEventType.Content,
+        value: 'Part A. ',
+      });
+      adapter.processEvent({
+        type: GeminiEventType.Content,
+        value: 'Part B.',
+      });
+      adapter.finalizeAssistantMessage();
+
+      adapter.emitResult({
+        isError: false,
+        durationMs: 10,
+        apiDurationMs: 5,
+        numTurns: 1,
+      });
+
+      expect(stdoutWriteSpy).toHaveBeenCalledWith('Part A. Part B.\n');
+    });
+
+    it('falls back to extracted text when no Content events were streamed', () => {
+      // Simulate a turn where the assistant only emitted a tool_use block —
+      // accumulated content is empty so we should fall back to the legacy
+      // extractTextFromBlocks payload.
+      adapter.finalizeAssistantMessage();
+
+      adapter.emitResult({
+        isError: false,
+        summary: 'Synthetic summary',
+        durationMs: 10,
+        apiDurationMs: 5,
+        numTurns: 1,
+      });
+
+      expect(stdoutWriteSpy).toHaveBeenCalledWith('Synthetic summary\n');
+    });
+
+    it('writes [tool] trace lines to stderr for ToolCallRequest events', () => {
+      adapter.processEvent({
+        type: GeminiEventType.ToolCallRequest,
+        value: {
+          callId: 'call_1',
+          name: 'shell',
+          args: { command: 'ls' },
+          isClientInitiated: false,
+          prompt_id: 'p1',
+        },
+      });
+
+      const calls = stderrWriteSpy.mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .join('');
+      expect(calls).toContain('[tool] shell');
+      expect(calls).toContain('"command":"ls"');
+    });
+
+    it('writes [tool-result] trace lines to stderr', () => {
+      adapter.emitToolResult(
+        {
+          callId: 'call_1',
+          name: 'shell',
+          args: { command: 'ls' },
+          isClientInitiated: false,
+          prompt_id: 'p1',
+        },
+        {
+          callId: 'call_1',
+          responseParts: [
+            {
+              functionResponse: {
+                id: 'call_1',
+                name: 'shell',
+                response: { output: 'file_a\nfile_b' },
+              },
+            },
+          ],
+          resultDisplay: 'file_a\nfile_b',
+          error: undefined,
+          errorType: undefined,
+          contentLength: undefined,
+        },
+      );
+
+      const calls = stderrWriteSpy.mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .join('');
+      expect(calls).toContain('[tool-result:ok] shell');
+      expect(calls).toContain('file_a');
+    });
+
+    it('buffers Thought tokens and flushes as a single [reasoning] line', () => {
+      // Simulate the Gemini streaming pattern: multiple Thought events with
+      // the same subject, each carrying a partial description token.
+      for (const token of ['Search', ' for', ' bugs', ' in', ' code']) {
+        adapter.processEvent({
+          type: GeminiEventType.Thought,
+          value: { subject: 'Planning', description: token },
+        });
+      }
+
+      // No stderr output yet — all tokens are buffered.
+      expect(stderrWriteSpy).not.toHaveBeenCalled();
+
+      // A subsequent ToolCallRequest should flush the buffer first.
+      adapter.processEvent({
+        type: GeminiEventType.ToolCallRequest,
+        value: {
+          callId: 'call_t',
+          name: 'shell',
+          args: { command: 'ls' },
+          isClientInitiated: false,
+          prompt_id: 'pt',
+        },
+      });
+
+      const combined = stderrWriteSpy.mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .join('');
+      // Thought tokens should appear as ONE merged line.
+      expect(combined).toContain(
+        '[reasoning] Planning: Search for bugs in code',
+      );
+      // No separate per-token lines.
+      const thoughtLines = combined
+        .split('\n')
+        .filter((l: string) => l.includes('[reasoning]'));
+      expect(thoughtLines).toHaveLength(1);
+    });
+
+    it('does not write to stderr when output format is JSON', () => {
+      vi.mocked(mockConfig.getOutputFormat).mockReturnValue(OutputFormat.JSON);
+      adapter.processEvent({
+        type: GeminiEventType.Content,
+        value: 'Should not stream',
+      });
+      expect(stderrWriteSpy).not.toHaveBeenCalled();
+    });
+
+    it('unwraps single-field JSON envelopes from MCP-style tool results', () => {
+      adapter.emitToolResult(
+        {
+          callId: 'mcp_1',
+          name: 'mcp__lss__call',
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'p2',
+        },
+        {
+          callId: 'mcp_1',
+          responseParts: [
+            {
+              functionResponse: {
+                id: 'mcp_1',
+                name: 'mcp__lss__call',
+                response: { output: '{"response":"AccessInfo: granted"}' },
+              },
+            },
+          ],
+          resultDisplay: undefined,
+          error: undefined,
+          errorType: undefined,
+          contentLength: undefined,
+        },
+      );
+      const combined = stderrWriteSpy.mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .join('');
+      expect(combined).toContain('AccessInfo: granted');
+      // The raw JSON wrapper must NOT appear in the trace.
+      expect(combined).not.toContain('"response":"AccessInfo');
+    });
+  });
+});
+
+describe('unwrapToolResultText', () => {
+  it('returns plain strings unchanged', () => {
+    expect(unwrapToolResultText('hello world')).toBe('hello world');
+    expect(unwrapToolResultText('')).toBe('');
+  });
+
+  it('unwraps {response: "..."} MCP envelopes', () => {
+    expect(unwrapToolResultText('{"response":"hello"}')).toBe('hello');
+  });
+
+  it('unwraps {output: "..."} shell envelopes', () => {
+    expect(unwrapToolResultText('{"output":"file_a\\nfile_b"}')).toBe(
+      'file_a\nfile_b',
+    );
+  });
+
+  it('recursively unwraps doubly-encoded JSON', () => {
+    expect(
+      unwrapToolResultText('{"response":"{\\"output\\":\\"deep\\"}"}'),
+    ).toBe('deep');
+  });
+
+  it('unwraps single-field envelopes regardless of key name', () => {
+    expect(unwrapToolResultText('{"foo":"bar"}')).toBe('bar');
+  });
+
+  it('prefers conventional text keys in multi-field objects', () => {
+    expect(unwrapToolResultText('{"response":"keep","other":42}')).toBe('keep');
+  });
+
+  it('returns the original string when no text-like field exists', () => {
+    const input = '{"a":1,"b":2}';
+    expect(unwrapToolResultText(input)).toBe(input);
+  });
+
+  it('caps recursion depth to avoid infinite loops', () => {
+    // 5 levels of nesting; should still terminate cleanly.
+    const deep = '{"r":"{\\"r\\":\\"{\\\\\\"r\\\\\\":\\\\\\"end\\\\\\"}\\"}"}';
+    expect(typeof unwrapToolResultText(deep)).toBe('string');
   });
 });
